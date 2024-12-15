@@ -22,8 +22,28 @@ class FitnessBot {
     }
 
     async initialize() {
-        // No need for client initialization with webhook setup
         console.log('Bot ready to process webhook events');
+        
+        // Schedule weekly summary checks
+        setInterval(() => this.checkWeeklySummaries(), 60 * 60 * 1000); // Check every hour
+    }
+
+    async checkWeeklySummaries() {
+        const now = new Date();
+        // If it's Sunday at 10 AM
+        if (now.getDay() === 0 && now.getHours() === 10) {
+            const users = await this.userManager.getAllUsers();
+            for (const user of users) {
+                try {
+                    const summary = await this.weeklySummary.generateWeeklySummary(user.id, user);
+                    if (summary) {
+                        await this.sendMessage(user.id, summary);
+                    }
+                } catch (error) {
+                    console.error(`Error sending weekly summary to ${user.id}:`, error);
+                }
+            }
+        }
     }
 
     async sendMessage(to, content) {
@@ -74,26 +94,28 @@ class FitnessBot {
                 };
             }
 
-            console.log('Sending message:', JSON.stringify(messageBody, null, 2));
-
             const response = await this.whatsappApi.post(
                 `/${process.env.PHONE_NUMBER_ID}/messages?access_token=${process.env.WHATSAPP_TOKEN}`,
                 messageBody
             );
 
             console.log('Message sent successfully:', response.data);
+            return response.data;
         } catch (error) {
-            console.error('Error sending message:', error.response?.data || error);
+            console.error('Error sending message:', error);
             throw error;
         }
     }
 
     async handleIncomingMessage(from, messageBody) {
         try {
-            // Get or create user session
+            // Get or create user
+            const user = await this.userManager.getUser(from);
+            
+            // Get or create session
             const session = await this.conversationManager.getSession(from);
             
-            // Create a message object that matches what the conversation manager expects
+            // Create a message object
             const msg = {
                 body: messageBody,
                 from: from,
@@ -102,13 +124,25 @@ class FitnessBot {
 
             // Process the message
             const response = await this.conversationManager.processMessage(msg, session);
+            
             if (response) {
                 await this.sendMessage(from, response);
+                
+                // Schedule reminders if needed
+                if (session.state === 'pre_workout' || session.state === 'post_workout') {
+                    await this.reminderSystem.scheduleReminder(from, session.state);
+                }
+                
+                // Update user data
+                await this.userManager.updateUser(from, {
+                    lastInteraction: Date.now(),
+                    state: session.state,
+                    ...session.data
+                });
             }
         } catch (error) {
             console.error('Error handling message:', error);
             
-            // Get OpenAI's help to handle the error gracefully
             try {
                 const session = await this.conversationManager.getSession(from);
                 const fallbackResponse = await this.conversationManager.handleFallback(
