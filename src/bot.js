@@ -1,158 +1,140 @@
 require('dotenv').config();
 const axios = require('axios');
-const Database = require('./database');
 const ConversationManager = require('./conversationManager');
 const UserManager = require('./userManager');
-const ReminderSystem = require('./reminderSystem');
-const WeeklySummary = require('./weeklySummary');
+const MessageScheduler = require('./messageScheduler');
 
 class FitnessBot {
     constructor() {
-        this.db = new Database();
         this.conversationManager = new ConversationManager();
         this.userManager = new UserManager();
-        this.reminderSystem = new ReminderSystem();
-        this.weeklySummary = new WeeklySummary();
+        this.messageScheduler = new MessageScheduler(this);
         
         // Configure axios for WhatsApp API calls
         this.whatsappApi = axios.create({
             baseURL: 'https://graph.facebook.com/v17.0',
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
     }
 
     async initialize() {
         console.log('Bot ready to process webhook events');
-        
-        // Schedule weekly summary checks
-        setInterval(() => this.checkWeeklySummaries(), 60 * 60 * 1000); // Check every hour
-    }
-
-    async checkWeeklySummaries() {
-        const now = new Date();
-        // If it's Sunday at 10 AM
-        if (now.getDay() === 0 && now.getHours() === 10) {
-            const users = await this.userManager.getAllUsers();
-            for (const user of users) {
-                try {
-                    const summary = await this.weeklySummary.generateWeeklySummary(user.id, user);
-                    if (summary) {
-                        await this.sendMessage(user.id, summary);
-                    }
-                } catch (error) {
-                    console.error(`Error sending weekly summary to ${user.id}:`, error);
-                }
-            }
-        }
+        this.messageScheduler.start();
     }
 
     async sendMessage(to, content) {
         try {
             let messageBody;
+            console.log('Preparing to send message:', { to, content }); // Debug log
 
-            // Check if the message contains button options (indicated by [...] [...])
-            const buttonMatch = content.match(/\[(.*?)\]/g);
-            if (buttonMatch) {
-                // Extract the message text (everything before the first [...])
-                const messageText = content.split('[')[0].trim();
-                
-                // Extract button titles
-                const buttons = buttonMatch.map(btn => {
-                    const buttonText = btn.replace(/[\[\]]/g, '').trim();
-                    return {
-                        type: 'reply',
-                        reply: {
-                            id: buttonText.toLowerCase().replace(/\s+/g, '_'),
-                            title: buttonText
+            if (typeof content === 'object' && content.text) {
+                if (content.buttons && content.buttons.length > 0) {
+                    console.log('Preparing interactive button message'); // Debug log
+                    messageBody = {
+                        messaging_product: 'whatsapp',
+                        recipient_type: 'individual',
+                        to: to,
+                        type: 'interactive',
+                        interactive: {
+                            type: 'button',
+                            body: {
+                                text: content.text
+                            },
+                            action: {
+                                buttons: content.buttons.map((button, index) => ({
+                                    type: 'reply',
+                                    reply: {
+                                        id: `btn_${index}`,
+                                        title: button.substring(0, 20) // WhatsApp button title limit
+                                    }
+                                })).slice(0, 3) // WhatsApp button count limit
+                            }
                         }
                     };
-                });
-
-                messageBody = {
-                    messaging_product: 'whatsapp',
-                    recipient_type: 'individual',
-                    to: to,
-                    type: 'interactive',
-                    interactive: {
-                        type: 'button',
-                        body: {
-                            text: messageText
-                        },
-                        action: {
-                            buttons: buttons.slice(0, 3) // WhatsApp allows max 3 buttons
-                        }
-                    }
-                };
+                } else {
+                    console.log('Preparing regular text message'); // Debug log
+                    messageBody = {
+                        messaging_product: 'whatsapp',
+                        recipient_type: 'individual',
+                        to: to,
+                        type: 'text',
+                        text: { body: content.text }
+                    };
+                }
             } else {
-                // Regular text message
+                console.log('Preparing legacy text message'); // Debug log
                 messageBody = {
                     messaging_product: 'whatsapp',
                     recipient_type: 'individual',
                     to: to,
                     type: 'text',
-                    text: { body: content }
+                    text: { body: String(content) }
                 };
             }
 
+            console.log('Sending message body:', JSON.stringify(messageBody, null, 2)); // Debug log
+
             const response = await this.whatsappApi.post(
-                `/${process.env.PHONE_NUMBER_ID}/messages?access_token=${process.env.WHATSAPP_TOKEN}`,
+                `/${process.env.PHONE_NUMBER_ID}/messages`,
                 messageBody
             );
 
             console.log('Message sent successfully:', response.data);
             return response.data;
         } catch (error) {
-            console.error('Error sending message:', error);
+            console.error('Error details:', {
+                message: error.message,
+                response: error.response?.data,
+                status: error.response?.status,
+                headers: error.response?.headers
+            });
             throw error;
         }
     }
 
     async handleIncomingMessage(from, messageBody) {
         try {
-            // Get or create user
-            const user = await this.userManager.getUser(from);
+            console.log('Raw incoming message:', messageBody);
             
-            // Get or create session
-            const session = await this.conversationManager.getSession(from);
-            
-            // Create a message object
-            const msg = {
-                body: messageBody,
-                from: from,
-                reply: async (text) => await this.sendMessage(from, text)
-            };
+            // Extract the message text
+            let messageText;
+            if (typeof messageBody === 'object' && messageBody.type === 'interactive') {
+                messageText = messageBody.interactive.button_reply?.title || '';
+            } else {
+                messageText = typeof messageBody === 'string' ? messageBody : messageBody.body;
+            }
 
-            // Process the message
-            const response = await this.conversationManager.processMessage(msg, session);
+            console.log('Processing message:', messageText);
+            
+            // Handle the message using the conversation manager
+            const response = await this.conversationManager.processMessage({
+                from: from,
+                body: messageText,
+                type: messageBody.type || 'text'
+            });
             
             if (response) {
-                await this.sendMessage(from, response);
-                
-                // Schedule reminders if needed
-                if (session.state === 'pre_workout' || session.state === 'post_workout') {
-                    await this.reminderSystem.scheduleReminder(from, session.state);
+                // Check if the response is already a formatted WhatsApp message
+                if (typeof response === 'object' && response.messaging_product === 'whatsapp') {
+                    await this.whatsappApi.post(
+                        `/${process.env.PHONE_NUMBER_ID}/messages`,
+                        response
+                    );
+                } else {
+                    // Handle simple text responses
+                    await this.sendMessage(from, response);
                 }
-                
-                // Update user data
-                await this.userManager.updateUser(from, {
-                    lastInteraction: Date.now(),
-                    state: session.state,
-                    ...session.data
-                });
             }
         } catch (error) {
             console.error('Error handling message:', error);
+            console.error('Error message:', error.message);
             
             try {
-                const session = await this.conversationManager.getSession(from);
-                const fallbackResponse = await this.conversationManager.handleFallback(
-                    { body: messageBody, error: error.message || 'Unknown error' },
-                    session
-                );
-                await this.sendMessage(from, fallbackResponse);
+                await this.sendMessage(from, {
+                    text: 'מצטער, משהו השתבש. נסה לכתוב "קפלן מניאק" כדי להתחיל מחדש.'
+                });
             } catch (fallbackError) {
-                console.error('Fallback error:', fallbackError);
-                await this.sendMessage(from, 'מצטער, משהו השתבש. אנא נסה שוב מאוחר יותר.');
+                console.error('Fallback error details:', fallbackError);
             }
         }
     }
